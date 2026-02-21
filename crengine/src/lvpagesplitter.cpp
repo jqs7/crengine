@@ -221,7 +221,7 @@ public:
     const LVRendLineInfo * footend;
     const LVRendLineInfo * footlast;
     LVArray<LVPageFootNoteInfo> footnotes;
-    LVArray<LVFootNote *> page_footnotes; // foonotes already on this page, to avoid duplicates
+    LVHashTable<LVFootNote *, bool> page_footnotes; // footnotes already on this page, to avoid duplicates
     LVPtrVector<const LVRendLineInfo> own_lines; // to store our own made lines, so we can clear them when done
     int lastpageend;
     int nb_lines;
@@ -243,6 +243,7 @@ public:
         , footstart(NULL)
         , footend(NULL)
         , footlast(NULL)
+        , page_footnotes(32)
         , lastpageend(0)
         , nb_lines(0)
         , nb_lines_rtl(0)
@@ -375,7 +376,7 @@ public:
             // on the new page), consider it already present in this new page
             // (even if one won't see the starting text and footnote number,
             // it's better than seeing again the same duplicated footnote text)
-            page_footnotes.add(footnote);
+            page_footnotes.set(footnote, true);
         }
         page->flags |= getLineTypeFlags();
         if (pagestart)
@@ -793,12 +794,10 @@ public:
     }
     bool IsFootNoteInCurrentPage( LVFootNote* note )
     {
-        if (page_footnotes.length() > 0)
-            for (int n = 0; n < page_footnotes.length(); n++)
-                if (note == page_footnotes[n])
-                    return true;
+        if ( page_footnotes.get(note) )
+            return true;
         // Assume calling code will add it to this page, so remember it
-        page_footnotes.add(note);
+        page_footnotes.set(note, true);
         return false;
     }
 };
@@ -825,14 +824,17 @@ public:
     int prev_page_flow;
 
     LVArray<LVPageFootNoteInfo> cur_page_footnotes;
-    LVArray<LVFootNote *> cur_page_seen_footnotes; // footnotes already on this page, to avoid duplicates
+    LVHashTable<LVFootNote *, bool> cur_page_seen_footnotes; // footnotes already on this page, to avoid duplicates
     LVArray<LVFootNote *> delayed_footnotes; // footnotes to be displayed on a next page
+    LVHashTable<LVFootNote *, bool> delayed_footnotes_set; // hash set companion for fast dedup lookups
 
     PageSplitState2(LVRendPageList * pl, LVPtrVector<LVRendLineInfo> & ls, int pageHeight, int docFontSize)
         : page_list(pl) // output
         , lines(ls)     // input
         , page_height(pageHeight) // parameters
         , doc_font_size(docFontSize)
+        , cur_page_seen_footnotes(32)
+        , delayed_footnotes_set(32)
     {
         footnote_margin = FOOTNOTE_MARGIN_REM * doc_font_size;
         nb_lines = lines.length();
@@ -851,7 +853,7 @@ public:
         cur_page_nb_footnotes_lines = 0;
         cur_page_nb_footnotes_lines_rtl = 0;
         cur_page_flow = -1;
-        cur_page_seen_footnotes.reset();
+        cur_page_seen_footnotes.clear();
     }
 
     inline void accountLine(bool is_rtl=false) {
@@ -881,6 +883,7 @@ public:
             for ( int i=0; i<delayed_footnotes.length(); i++ )
                 addFootnoteToPage( delayed_footnotes[i] );
             delayed_footnotes.reset();
+            delayed_footnotes_set.clear();
         }
     }
 
@@ -1115,15 +1118,15 @@ public:
         if ( note->empty() )
             return;
         // Avoid duplicated footnotes in the same page
-        if ( cur_page_seen_footnotes.indexOf(note) >= 0 )
+        if ( cur_page_seen_footnotes.get(note) )
             return;
-        cur_page_seen_footnotes.add(note);
+        cur_page_seen_footnotes.set(note, true);
         // Also check the actual footnote if this one is just a proxy
         LVFootNote * actual_footnote = note->getActualFootnote();
         if ( actual_footnote ) {
-            if ( cur_page_seen_footnotes.indexOf(actual_footnote) >= 0 )
+            if ( cur_page_seen_footnotes.get(actual_footnote) )
                 return;
-            cur_page_seen_footnotes.add(actual_footnote);
+            cur_page_seen_footnotes.set(actual_footnote, true);
         }
 
         int note_nb_lines = note->length();
@@ -1152,9 +1155,9 @@ public:
                 // on the new page): consider it already present in this new page
                 // (even if one won't see the starting text and footnote number,
                 // it's better than seeing again the same duplicated footnote text)
-                cur_page_seen_footnotes.add(note);
+                cur_page_seen_footnotes.set(note, true);
                 if ( actual_footnote )
-                    cur_page_seen_footnotes.add(actual_footnote);
+                    cur_page_seen_footnotes.set(actual_footnote, true);
             }
             // This footnote line fits
             note_bottom = new_note_bottom;
@@ -1188,10 +1191,10 @@ public:
                 LVFootNote* note = notes->get(j);
                 if ( note->empty() )
                     continue;
-                if ( cur_page_seen_footnotes.indexOf(note) >= 0 )
+                if ( cur_page_seen_footnotes.get(note) )
                     continue; // Already shown on this page
                 LVFootNote * actual_footnote = note->getActualFootnote();
-                if ( actual_footnote && cur_page_seen_footnotes.indexOf(actual_footnote) >= 0 )
+                if ( actual_footnote && cur_page_seen_footnotes.get(actual_footnote) )
                     continue;
                 // Collect all nested footnotes and add them to the current line's list
                 // of footnotes links (avoiding duplicates) so we can just process them
@@ -1221,8 +1224,10 @@ public:
                 }
                 if ( !delayed_footnotes.empty() ) {
                     // Already some delayed footnotes
-                    if ( delayed_footnotes.indexOf(note) < 0 )
+                    if ( !delayed_footnotes_set.get(note) ) {
                         delayed_footnotes.add( note );
+                        delayed_footnotes_set.set( note, true );
+                    }
                     continue;
                 }
                 if ( cur_page_nb_footnotes_lines == 0 ) {
@@ -1230,8 +1235,10 @@ public:
                     // If they don't, delay all footnotes but don't flush the page,
                     // as some main content line could still fit on this page.
                     if ( note->getLine(0)->getHeight() > getAvailableHeightForFootnotes() ) {
-                        if ( delayed_footnotes.indexOf(note) < 0 )
+                        if ( !delayed_footnotes_set.get(note) ) {
                             delayed_footnotes.add( note );
+                            delayed_footnotes_set.set( note, true );
+                        }
                         continue;
                     }
                     // Note: this could be made even more generic, delaying 2++ lines
