@@ -536,8 +536,18 @@ void lString32::alloc(int sz)
     pchunk = (lstring_chunk_t*)::malloc(sizeof(lstring_chunk_t));
 #endif
     pchunk->buf32 = (lChar32*) ::malloc( sizeof(lChar32) * (sz+1) );
-    assert( pchunk->buf32!=NULL );
-    pchunk->size = sz;
+    if ( !pchunk->buf32 ) {
+        CRLog::error("lString32::alloc(%d): allocation failed!", sz);
+        pchunk->buf32 = (lChar32*) ::malloc( sizeof(lChar32) );
+        if ( pchunk->buf32 ) {
+            pchunk->buf32[0] = 0;
+            pchunk->size = 0;
+        } else {
+            crFatalError(-2, "lString32: out of memory");
+        }
+    } else {
+        pchunk->size = sz;
+    }
     pchunk->nref = 1;
 }
 
@@ -758,9 +768,10 @@ lString32 & lString32::assign(const lString32 & str, size_type offset, size_type
         {
             if (pchunk->nref==1)
             {
-                if (pchunk->size < count)
-                {
-                    // resize is necessary
+                if (pchunk == EMPTY_STR_32) {
+                    CRLog::error("lString32::operator=: EMPTY_STR_32 nref corrupted to 1");
+                    alloc(count);
+                } else if (pchunk->size < count) {
                     pchunk->buf32 = (lChar32*) ::realloc( pchunk->buf32, sizeof(lChar32)*(count+1) );
                     pchunk->size = count;
                 }
@@ -811,6 +822,13 @@ void lString32::reserve(size_type n)
 {
     if (pchunk->nref==1)
     {
+        if (pchunk == EMPTY_STR_32) {
+            CRLog::error("lString32::reserve: EMPTY_STR_32 nref corrupted to 1");
+            alloc(n);
+            pchunk->buf32[0] = 0;
+            pchunk->len = 0;
+            return;
+        }
         if (pchunk->size < n)
         {
             pchunk->buf32 = (lChar32*) ::realloc( pchunk->buf32, sizeof(lChar32)*(n+1) );
@@ -820,10 +838,19 @@ void lString32::reserve(size_type n)
     else
     {
         lstring_chunk_t * poldchunk = pchunk;
+        int oldlen = poldchunk->len;
         release();
         alloc( n );
-        _lStr_memcpy( pchunk->buf32, poldchunk->buf32, poldchunk->len+1 );
-        pchunk->len = poldchunk->len;
+        if (poldchunk == EMPTY_STR_32 || oldlen <= 0) {
+            pchunk->buf32[0] = 0;
+            pchunk->len = 0;
+        } else if ( pchunk->buf32 && poldchunk->buf32 ) {
+            _lStr_memcpy( pchunk->buf32, poldchunk->buf32, oldlen+1 );
+            pchunk->len = oldlen;
+        } else {
+            pchunk->buf32[0] = 0;
+            pchunk->len = 0;
+        }
     }
 }
 
@@ -832,14 +859,20 @@ void lString32::lock( size_type newsize )
     if (pchunk->nref>1)
     {
         lstring_chunk_t * poldchunk = pchunk;
+        int oldlen = poldchunk->len;
         release();
         alloc( newsize );
-        size_type len = newsize;
-        if (len>poldchunk->len)
-            len = poldchunk->len;
-        _lStr_memcpy( pchunk->buf32, poldchunk->buf32, len );
-        pchunk->buf32[len]=0;
-        pchunk->len = len;
+        if (poldchunk == EMPTY_STR_32 || oldlen <= 0) {
+            pchunk->buf32[0] = 0;
+            pchunk->len = 0;
+        } else {
+            size_type len = newsize;
+            if (len > (size_type)oldlen)
+                len = oldlen;
+            _lStr_memcpy( pchunk->buf32, poldchunk->buf32, len );
+            pchunk->buf32[len]=0;
+            pchunk->len = len;
+        }
     }
 }
 
@@ -1919,6 +1952,13 @@ void lString8::reserve(size_type n)
 {
     if (pchunk->nref==1)
     {
+        if (pchunk == EMPTY_STR_8) {
+            CRLog::error("lString8::reserve: EMPTY_STR_8 nref corrupted to 1");
+            alloc(n);
+            pchunk->buf8[0] = 0;
+            pchunk->len = 0;
+            return;
+        }
         if (pchunk->size < n)
         {
             pchunk->buf8 = (lChar8*) ::realloc( pchunk->buf8, sizeof(lChar8)*(n+1) );
@@ -1928,10 +1968,19 @@ void lString8::reserve(size_type n)
     else
     {
         lstring_chunk_t * poldchunk = pchunk;
+        int oldlen = poldchunk->len;
         release();
         alloc( n );
-        _lStr_memcpy( pchunk->buf8, poldchunk->buf8, poldchunk->len+1 );
-        pchunk->len = poldchunk->len;
+        if (poldchunk == EMPTY_STR_8 || oldlen <= 0) {
+            pchunk->buf8[0] = 0;
+            pchunk->len = 0;
+        } else if ( pchunk->buf8 && poldchunk->buf8 ) {
+            _lStr_memcpy( pchunk->buf8, poldchunk->buf8, oldlen+1 );
+            pchunk->len = oldlen;
+        } else {
+            pchunk->buf8[0] = 0;
+            pchunk->len = 0;
+        }
     }
 }
 
@@ -1940,14 +1989,20 @@ void lString8::lock( size_type newsize )
     if (pchunk->nref>1)
     {
         lstring_chunk_t * poldchunk = pchunk;
+        int oldlen = poldchunk->len;
         release();
         alloc( newsize );
-        size_type len = newsize;
-        if (len>poldchunk->len)
-            len = poldchunk->len;
-        _lStr_memcpy( pchunk->buf8, poldchunk->buf8, len );
-        pchunk->buf8[len]=0;
-        pchunk->len = len;
+        if (poldchunk == EMPTY_STR_8 || oldlen <= 0) {
+            pchunk->buf8[0] = 0;
+            pchunk->len = 0;
+        } else {
+            size_type len = newsize;
+            if (len > (size_type)oldlen)
+                len = oldlen;
+            _lStr_memcpy( pchunk->buf8, poldchunk->buf8, len );
+            pchunk->buf8[len]=0;
+            pchunk->len = len;
+        }
     }
 }
 
