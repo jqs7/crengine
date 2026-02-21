@@ -12433,6 +12433,8 @@ void getRenderedWidths(ldomNode * node, int &maxWidth, int &minWidth, int direct
         #define MAX_TEXT_CHUNK_SIZE 4096
         static lUInt16 widths[MAX_TEXT_CHUNK_SIZE+1];
         static lUInt8 flags[MAX_TEXT_CHUNK_SIZE+1];
+        if ( len > MAX_TEXT_CHUNK_SIZE )
+            len = MAX_TEXT_CHUNK_SIZE;
 
         // todo: use fribidi and split measurement at fribidi level change,
         // and beware left/right side bearing adjustments...
