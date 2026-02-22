@@ -3269,7 +3269,7 @@ bool renderAsListStylePositionInside( const css_style_ref_t style, bool is_rtl=f
 // and to get paragraph direction (LTR/RTL/UNSET).
 void renderFinalBlock( ldomNode * enode, LFormattedText * txform, RenderRectAccessor * fmt, lUInt32 & baseflags,
                        int indent, int line_h, TextLangCfg * lang_cfg, int valign_dy, bool * is_link_start,
-                       lString32 running_bidi_ctrlchars )
+                       lString32 running_bidi_ctrlchars, const lString32 * footnote_id )
 {
     bool legacy_rendering = !BLOCK_RENDERING_N(enode, ENHANCED);
     if ( enode->isElement() ) {
@@ -3990,12 +3990,18 @@ void renderFinalBlock( ldomNode * enode, LFormattedText * txform, RenderRectAcce
                 lUInt32 flags = styleToTextFmtFlags( true, enode->getStyle(), baseflags, direction );
                 flags |= linkflags;
                 txform->AddSourceObject(flags, LTEXT_OBJECT_IS_IMAGE, line_h, valign_dy, indent, enode, lang_cfg );
+                if ((linkflags & LTEXT_IS_LINK) && footnote_id && !footnote_id->empty()) {
+                    txform->AddFootnoteLink(txform->GetSrcCount() - 1, *footnote_id);
+                }
             }
             else { // inline image
                 // We use the flags computed previously (and not baseflags) as they
                 // carry vertical alignment
                 flags |= linkflags;
                 txform->AddSourceObject(flags, LTEXT_OBJECT_IS_IMAGE, line_h, valign_dy, indent, enode, lang_cfg );
+                if ((linkflags & LTEXT_IS_LINK) && footnote_id && !footnote_id->empty()) {
+                    txform->AddFootnoteLink(txform->GetSrcCount() - 1, *footnote_id);
+                }
                 flags &= ~LTEXT_FLAG_NEWLINE & ~LTEXT_SRC_IS_CLEAR_BOTH; // clear newline flag
             }
         }
@@ -4239,13 +4245,26 @@ void renderFinalBlock( ldomNode * enode, LFormattedText * txform, RenderRectAcce
             // the first non-space-only text node
             bool * is_link_start_p = is_link_start; // copy of orignal (possibly NULL) pointer
             bool tmp_is_link_start = true; // new bool, for new pointer if we're a <A>
+            const lString32 * footnote_id_p = footnote_id;
+            lString32 tmp_footnote_id;
             if ( nodeElementId == el_a ) {
                 is_link_start_p = &tmp_is_link_start; // use new pointer
+                // Pre-extract footnote link ID so page splitting can use it
+                // without re-traversing the DOM tree upward from each word
+                if (enode->getDocument()->getDocFlag(DOC_FLAG_ENABLE_FOOTNOTES)
+                        && enode->hasAttribute(LXML_NS_ANY, attr_href)
+                        && !STYLE_HAS_CR_HINT(style, NOTEREF_IGNORE)) {
+                    lString32 href = enode->getAttributeValue(LXML_NS_ANY, attr_href);
+                    if (href.firstChar() == '#') {
+                        tmp_footnote_id = href.substr(1);
+                        footnote_id_p = &tmp_footnote_id;
+                    }
+                }
             }
             for (int i=0; i<cnt; i++)
             {
                 ldomNode * child = enode->getChildNode( i );
-                renderFinalBlock( child, txform, fmt, flags, indent, line_h, lang_cfg, valign_dy, is_link_start_p, running_bidi_ctrlchars );
+                renderFinalBlock( child, txform, fmt, flags, indent, line_h, lang_cfg, valign_dy, is_link_start_p, running_bidi_ctrlchars, footnote_id_p );
             }
 
             if ( addGeneratedContent ) {
@@ -4522,6 +4541,9 @@ void renderFinalBlock( ldomNode * enode, LFormattedText * txform, RenderRectAcce
             if ( txt.length() > 0 ) {
                 txform->AddSourceLine( txt.c_str(), txt.length(), cl, bgcl, font.get(), lang_cfg, baseflags | tflags,
                     line_h, valign_dy, indent, enode, textOffset, letter_spacing );
+                if ((tflags & LTEXT_IS_LINK) && footnote_id && !footnote_id->empty()) {
+                    txform->AddFootnoteLink(txform->GetSrcCount() - 1, *footnote_id);
+                }
                 baseflags &= ~LTEXT_FLAG_NEWLINE & ~LTEXT_SRC_IS_CLEAR_BOTH; // clear newline flag
                 // To show the lang tag for the lang used for this text node AFTER it:
                 // lString32 lang_tag_txt = U"[" + (lang_cfg ? lang_cfg->getLangTag() : lString32("??")) + U"]";
@@ -5411,16 +5433,21 @@ int renderBlockElementLegacy( LVRendPageContext & context, ldomNode * enode, int
                             if ( line->words[w].flags & LTEXT_WORD_IS_LINK_START ) {
                                 const src_text_fragment_t * src = txform->GetSrcInfo( line->words[w].src_text_index );
                                 if ( src && src->object ) {
-                                    ldomNode * node = (ldomNode*)src->object;
-                                    ldomNode * parent = node->getParentNode();
-                                    while (parent && parent->getNodeId() != el_a)
-                                        parent = parent->getParentNode();
-                                    if ( parent && parent->hasAttribute(LXML_NS_ANY, attr_href)
-                                                && !STYLE_HAS_CR_HINT(parent->getStyle(), NOTEREF_IGNORE) ) {
-                                        lString32 href = parent->getAttributeValue(LXML_NS_ANY, attr_href);
-                                        if ( href.firstChar()=='#' ) {
-                                            href.erase(0,1);
-                                            context.addLink( href, link_insert_pos );
+                                    lString32 fnId = txform->GetFootnoteLink(line->words[w].src_text_index);
+                                    if (!fnId.empty()) {
+                                        context.addLink( fnId, link_insert_pos );
+                                    } else {
+                                        ldomNode * node = (ldomNode*)src->object;
+                                        ldomNode * parent = node->getParentNode();
+                                        while (parent && parent->getNodeId() != el_a)
+                                            parent = parent->getParentNode();
+                                        if ( parent && parent->hasAttribute(LXML_NS_ANY, attr_href)
+                                                    && !STYLE_HAS_CR_HINT(parent->getStyle(), NOTEREF_IGNORE) ) {
+                                            lString32 href = parent->getAttributeValue(LXML_NS_ANY, attr_href);
+                                            if ( href.firstChar()=='#' ) {
+                                                href.erase(0,1);
+                                                context.addLink( href, link_insert_pos );
+                                            }
                                         }
                                     }
                                 }
@@ -5447,16 +5474,21 @@ int renderBlockElementLegacy( LVRendPageContext & context, ldomNode * enode, int
                             if ( line->words[w].flags & LTEXT_WORD_IS_LINK_START ) {
                                 const src_text_fragment_t * src = txform->GetSrcInfo( line->words[w].src_text_index );
                                 if ( src && src->object ) {
-                                    ldomNode * node = (ldomNode*)src->object;
-                                    ldomNode * parent = node->getParentNode();
-                                    while (parent && parent->getNodeId() != el_a)
-                                        parent = parent->getParentNode();
-                                    if ( parent && parent->hasAttribute(LXML_NS_ANY, attr_href)
-                                                && !STYLE_HAS_CR_HINT(parent->getStyle(), NOTEREF_IGNORE) ) {
-                                        lString32 href = parent->getAttributeValue(LXML_NS_ANY, attr_href);
-                                        if ( href.firstChar()=='#' ) {
-                                            href.erase(0,1);
-                                            context.addLink( href, link_insert_pos );
+                                    lString32 fnId = txform->GetFootnoteLink(line->words[w].src_text_index);
+                                    if (!fnId.empty()) {
+                                        context.addLink( fnId, link_insert_pos );
+                                    } else {
+                                        ldomNode * node = (ldomNode*)src->object;
+                                        ldomNode * parent = node->getParentNode();
+                                        while (parent && parent->getNodeId() != el_a)
+                                            parent = parent->getParentNode();
+                                        if ( parent && parent->hasAttribute(LXML_NS_ANY, attr_href)
+                                                    && !STYLE_HAS_CR_HINT(parent->getStyle(), NOTEREF_IGNORE) ) {
+                                            lString32 href = parent->getAttributeValue(LXML_NS_ANY, attr_href);
+                                            if ( href.firstChar()=='#' ) {
+                                                href.erase(0,1);
+                                                context.addLink( href, link_insert_pos );
+                                            }
                                         }
                                     }
                                 }
@@ -9043,16 +9075,23 @@ void renderBlockElementEnhanced( FlowState * flow, ldomNode * enode, int x, int 
                                     continue;
                                 }
                                 if ( src && src->object ) {
-                                    ldomNode * node = (ldomNode*)src->object;
-                                    ldomNode * parent = node->getParentNode();
-                                    while (parent && parent->getNodeId() != el_a)
-                                        parent = parent->getParentNode();
-                                    if ( parent && parent->hasAttribute(LXML_NS_ANY, attr_href)
-                                                && !STYLE_HAS_CR_HINT(parent->getStyle(), NOTEREF_IGNORE) ) {
-                                        lString32 href = parent->getAttributeValue(LXML_NS_ANY, attr_href);
-                                        if ( href.firstChar()=='#' ) {
-                                            href.erase(0,1);
-                                            flow->getPageContext()->addLink( href, link_insert_pos );
+                                    // Use pre-extracted footnote link when available (O(1) hash lookup
+                                    // vs. O(D) DOM traversal upward to find <a> parent)
+                                    lString32 fnId = txform->GetFootnoteLink(line->words[w].src_text_index);
+                                    if (!fnId.empty()) {
+                                        flow->getPageContext()->addLink( fnId, link_insert_pos );
+                                    } else {
+                                        ldomNode * node = (ldomNode*)src->object;
+                                        ldomNode * parent = node->getParentNode();
+                                        while (parent && parent->getNodeId() != el_a)
+                                            parent = parent->getParentNode();
+                                        if ( parent && parent->hasAttribute(LXML_NS_ANY, attr_href)
+                                                    && !STYLE_HAS_CR_HINT(parent->getStyle(), NOTEREF_IGNORE) ) {
+                                            lString32 href = parent->getAttributeValue(LXML_NS_ANY, attr_href);
+                                            if ( href.firstChar()=='#' ) {
+                                                href.erase(0,1);
+                                                flow->getPageContext()->addLink( href, link_insert_pos );
+                                            }
                                         }
                                     }
                                 }

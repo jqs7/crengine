@@ -288,6 +288,7 @@ typedef struct
    lUInt16               width;         /**< width of text fragment */
    lUInt16               page_height;   /**< max page height */
    LVHashTable<lUInt32, lString32Collection*> * inlineboxes_links;
+   LVHashTable<lUInt32, lString32> * footnote_links; // src_index -> footnote ID (pre-extracted from <a href="#id">)
 
     // Each line box starts with a zero-width inline box (called "strut") with
     // the element's font and line height properties:
@@ -513,6 +514,18 @@ public:
     }
 
     lString32Collection * GetInlineBoxLinks( ldomNode * node );
+
+    void AddFootnoteLink(int src_index, const lString32 & id) {
+        if (!m_pbuffer->footnote_links)
+            m_pbuffer->footnote_links = new LVHashTable<lUInt32, lString32>(16);
+        m_pbuffer->footnote_links->set((lUInt32)src_index, id);
+    }
+
+    lString32 GetFootnoteLink(int src_index) {
+        if (m_pbuffer->footnote_links)
+            return m_pbuffer->footnote_links->get((lUInt32)src_index);
+        return lString32::empty_str;
+    }
 
     void Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * marks = NULL,  ldomMarkedRangeList *bookmarks = NULL );
 

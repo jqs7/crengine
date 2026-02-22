@@ -208,6 +208,10 @@ void lvtextFreeFormatter( formatted_text_fragment_t * pbuffer )
         }
         delete pbuffer->inlineboxes_links;
     }
+    if (pbuffer->footnote_links)
+    {
+        delete pbuffer->footnote_links;
+    }
     free(pbuffer);
 }
 
@@ -5565,6 +5569,13 @@ static void freeFrmLines( formatted_text_fragment_t * m_pbuffer )
         free( m_pbuffer->inlineboxes_links );
     }
     m_pbuffer->inlineboxes_links = NULL;
+
+    // Also clear pre-extracted footnote links
+    if (m_pbuffer->footnote_links)
+    {
+        delete m_pbuffer->footnote_links;
+    }
+    m_pbuffer->footnote_links = NULL;
 }
 
 // experimental formatter

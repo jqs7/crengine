@@ -1187,6 +1187,17 @@ public:
                 continue;
 
             LVFootNoteList * notes = line->getLinks();
+
+            // Hash set for O(1) dedup when collecting nested footnotes
+            // (replaces O(N) indexOf scans on the notes array)
+            LVHashTable<LVFootNote*, bool> notes_seen_set(notes->length() * 2 + 16);
+            for (int k = 0; k < notes->length(); k++) {
+                notes_seen_set.set(notes->get(k), true);
+                LVFootNote * actual = notes->get(k)->getActualFootnote();
+                if (actual)
+                    notes_seen_set.set(actual, true);
+            }
+
             for ( int j=0; j<notes->length(); j++ ) {
                 LVFootNote* note = notes->get(j);
                 if ( note->empty() )
@@ -1210,15 +1221,18 @@ public:
                     }
                     for ( int nn=0; nn<nested_line->getLinks()->length(); nn++ ) {
                         LVFootNote * nested_note = nested_line->getLinks()->get(nn);
-                        if ( notes->indexOf(nested_note) >= 0 )
+                        if ( notes_seen_set.get(nested_note) )
                             continue; // Already referenced among the current lines notes
-                        LVFootNote * actual_footnote = nested_note->getActualFootnote();
-                        if ( actual_footnote && notes->indexOf(actual_footnote) >= 0 )
+                        LVFootNote * nested_actual = nested_note->getActualFootnote();
+                        if ( nested_actual && notes_seen_set.get(nested_actual) )
                             continue;
                         if ( nested_note->length() ) {
                             // Add all new nested footnotes depth-first in order of
                             // appearance to the links on the original line
                             notes->insert(j+1+(nb_nested_notes++), nested_note);
+                            notes_seen_set.set(nested_note, true);
+                            if (nested_actual)
+                                notes_seen_set.set(nested_actual, true);
                         }
                     }
                 }
