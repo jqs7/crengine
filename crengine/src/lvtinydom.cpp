@@ -242,6 +242,13 @@ enum CacheFileBlockType {
 #include <lvtextfm.h>
 #include "../include/lvdocviewprops.h"
 
+// Rust FFI declarations for LDOM pack/unpack and settings hash
+extern "C" {
+    int kre_ldom_pack(const uint8_t* buf, size_t bufsize, uint8_t** dstbuf, uint32_t* dstsize);
+    int kre_ldom_unpack(const uint8_t* compbuf, size_t compsize, uint8_t** dstbuf, uint32_t* dstsize);
+    uint32_t kre_calc_global_settings_hash(int document_id, int already_rendered);
+}
+
 // define to store new text nodes as persistent text, instead of mutable
 #define USE_PERSISTENT_TEXT 1
 
@@ -387,56 +394,25 @@ static lUInt32 calcHash(const lUInt8 * s, int len)
 {
     return XXH32(s, len, 0);
 }
+// C++ wrapper functions for Rust FFI
+extern "C" {
+    int fontMan_GetKerningMode() { return (int)fontMan->GetKerningMode(); }
+    int fontMan_GetMonospaceSizeScale() { return fontMan->GetMonospaceSizeScale(); }
+    int fontMan_GetFallbackFontSizesAdjusted() { return (int)fontMan->GetFallbackFontSizesAdjusted(); }
+    uint32_t fontMan_GetFontListHash(int document_id) { return fontMan->GetFontListHash(document_id); }
+    int LVRendGetBaseFontWeight_wrapper() { return LVRendGetBaseFontWeight(); }
+    int getGlobalRenderDPI() { return gRenderDPI; }
+    uint32_t TextLangMan_getHash() { return TextLangMan::getHash(); }
+    int HyphMan_getLeftHyphenMin() { return HyphMan::getLeftHyphenMin(); }
+    int HyphMan_getRightHyphenMin() { return HyphMan::getRightHyphenMin(); }
+    int HyphMan_getTrustSoftHyphens() { return HyphMan::getTrustSoftHyphens(); }
+    uint32_t UserHyphDict_getHash() { return UserHyphDict::getHash(); }
+}
+
 lUInt32 calcGlobalSettingsHash(int documentId, bool already_rendered)
 {
-    lUInt32 hash = FORMATTING_VERSION_ID;
-    // if ( fontMan->getKerning() )
-    //     hash += 127365;
-    hash = hash * 31 + (int)fontMan->GetKerningMode();
-    hash = hash * 31 + fontMan->GetMonospaceSizeScale();
-    hash = hash * 31 + (int)fontMan->GetFallbackFontSizesAdjusted();
-    hash = hash * 31 + fontMan->GetFontListHash(documentId);
-    // Hinting mode change does not need to trigger a re-render, as since
-    // we use FT_LOAD_TARGET_LIGHT, hinting has no effect on the x-axis
-    // and should not change glyph advances, so it should not change line
-    // layout and paragraphs' heights. We just need to _renderedBlockCache.clear()
-    // when hinting mode is changed to reformat paragraphs.
-    // hash = hash * 31 + (int)fontMan->GetHintingMode();
-    hash = hash * 31 + LVRendGetBaseFontWeight();
-    hash = hash * 31 + gRenderDPI;
-    // If not yet rendered (initial loading with XML parsing), we can
-    // ignore some global flags that have not yet produced any effect,
-    // so they can possibly be updated between loading and rendering
-    // without trigerring a drop of all the styles and rend methods
-    // set up in the XML loading phase. This is mostly only needed
-    // for TextLangMan::getHash(), as the lang can be set by frontend
-    // code after the loading phase, once the book language is known
-    // from its metadata, before the rendering that will use the
-    // language set. (We could ignore some of the other settings
-    // above if we ever need to reset them in between these phases;
-    // just be certain they are really not used in the first phase.)
-    if ( already_rendered ) {
-        hash = hash * 31 + TextLangMan::getHash();
-        hash = hash * 31 + HyphMan::getLeftHyphenMin();
-        hash = hash * 31 + HyphMan::getRightHyphenMin();
-        hash = hash * 31 + HyphMan::getTrustSoftHyphens();
-        hash = hash * 31 + UserHyphDict::getHash();
-    }
-    /*
-    printf("  %d %d %d %d %d %d %d %d %d %d %d\n",
-        (int)fontMan->GetKerningMode(),
-        fontMan->GetMonospaceSizeScale(),
-        (int)fontMan->GetFallbackFontSizesAdjusted(),
-        fontMan->GetFontListHash(documentId),
-        LVRendGetBaseFontWeight(),
-        gRenderDPI,
-        TextLangMan::getHash(),
-        HyphMan::getLeftHyphenMin(),
-        HyphMan::getRightHyphenMin(),
-        HyphMan::getTrustSoftHyphens(),
-        UserHyphDict::getHash());
-    */
-    return hash;
+    // Use Rust implementation
+    return kre_calc_global_settings_hash(documentId, already_rendered ? 1 : 0);
 }
 
 #if 0
@@ -584,10 +560,6 @@ class CacheFile
     LVPtrVector<CacheFileItem, true> _index; // full file block index
     LVPtrVector<CacheFileItem, false> _freeIndex; // free file block index
     LVHashTable<lUInt32, CacheFileItem*> _map; // hash map for fast search
-#if (USE_ZSTD == 1)
-    zstd_comp_ress_t* _comp_ress;
-    zstd_decomp_ress_t* _decomp_ress;
-#endif
     // searches for existing block
     CacheFileItem * findBlock( lUInt16 type, lUInt16 index );
     // alocates block at index, reuses existing one, if possible
@@ -640,12 +612,6 @@ public:
     /// reads block as a stream
     LVStreamRef readStream(lUInt16 type, lUInt16 index);
 
-#if (USE_ZSTD == 1)
-    bool allocCompRess(void);
-    bool freeCompRess(void);
-    bool allocDecompRess(void);
-    bool freeDecompRess(void);
-#endif
     /// pack data from buf to dstbuf
     bool ldomPack( const lUInt8 * buf, size_t bufsize, lUInt8 * &dstbuf, lUInt32 & dstsize );
     /// unpack data from compbuf to dstbuf
@@ -676,9 +642,6 @@ public:
 // create uninitialized cache file, call open or create to initialize
 CacheFile::CacheFile(lUInt32 domVersion)
 : _sectorSize( CACHE_FILE_SECTOR_SIZE ), _size(0), _indexChanged(false), _dirty(true), _domVersion(domVersion), _cachePath(lString32::empty_str), _map(1024)
-#if (USE_ZSTD == 1)
-    , _comp_ress(nullptr), _decomp_ress(nullptr)
-#endif
 {
 }
 
@@ -690,10 +653,6 @@ CacheFile::~CacheFile()
         //CRTimerUtil infinite;
         //flush( true, infinite );
     }
-#if (USE_ZSTD == 1)
-    freeCompRess();
-    freeDecompRess();
-#endif
 }
 
 /// sets dirty flag value, returns true if value is changed
@@ -1291,303 +1250,17 @@ bool CacheFile::create( LVStreamRef stream )
     return true;
 }
 
-#if (USE_ZSTD == 1)
-bool CacheFile::allocCompRess(void)
-{
-    // printf("CacheFile::allocCompRess\n");
-    _comp_ress = new zstd_comp_ress_t;
-    _comp_ress->buffOut = nullptr;
-    _comp_ress->cctx = nullptr;
-
-    _comp_ress->buffOutSize = ZSTD_CStreamOutSize();
-    _comp_ress->buffOut = malloc(_comp_ress->buffOutSize);
-    if (!_comp_ress->buffOut) {
-        return false;
-    }
-    _comp_ress->cctx = ZSTD_createCCtx();
-    if (_comp_ress->cctx == nullptr) {
-        return false;
-    }
-
-    // Parameters are sticky
-    // NOTE: ZSTD_CLEVEL_DEFAULT is currently 3, sane range is 1-19
-    ZSTD_CCtx_setParameter(_comp_ress->cctx, ZSTD_c_compressionLevel, ZSTD_CLEVEL_DEFAULT);
-    // This would be redundant with CRe's own calcHash, AFAICT?
-    //ZSTD_CCtx_setParameter(_comp_ress->cctx, ZSTD_c_checksumFlag, 1);
-
-    // Threading? (Requires libzstd built w/ threading support)
-    // NOTE: Since we always use ZSTD_e_end, which basically defers to ZSTD_compress2(), this will *not* make it async,
-    //       it'll still block.
-    //ZSTD_CCtx_setParameter(_comp_ress->cctx, ZSTD_c_nbWorkers, 4);
-
-    return true;
-}
-
-bool CacheFile::freeCompRess(void)
-{
-    // printf("CacheFile::freeCompRess\n");
-    if (_comp_ress) {
-        ZSTD_freeCCtx(_comp_ress->cctx);
-        _comp_ress->cctx = nullptr;
-        free(_comp_ress->buffOut);
-        _comp_ress->buffOut = nullptr;
-        delete _comp_ress;
-        _comp_ress = nullptr;
-
-        return true;
-    }
-
-    return false;
-}
-
-/// pack data from buf to dstbuf
+/// pack data from buf to dstbuf using Rust implementation
 bool CacheFile::ldomPack( const lUInt8 * buf, size_t bufsize, lUInt8 * &dstbuf, lUInt32 & dstsize )
 {
-    // printf("ldomPack() <- %p (%zu)\n", buf, bufsize);
-
-    // Lazy init our ressources, and keep 'em around
-    if (!_comp_ress) {
-        if(!allocCompRess()) {
-            CRLog::error("ldomPack() failed to allocate ressources");
-            return false;
-        }
-    }
-
-    // c.f., ZSTD's examples/streaming_compression.c
-    // NOTE: We could probably gain much by training zstd and using a dictionary, here ;).
-    size_t const buffOutSize = _comp_ress->buffOutSize;
-    void*  const buffOut = _comp_ress->buffOut;
-    ZSTD_CCtx* const cctx = _comp_ress->cctx;
-
-    // Reset the context
-    size_t const err = ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only);
-    if (ZSTD_isError(err)) {
-        CRLog::error("ZSTD_CCtx_reset() error: %s", ZSTD_getErrorName(err));
-        return false;
-    }
-
-    // Tell the compressor just how much data we need to compress
-    ZSTD_CCtx_setPledgedSrcSize(cctx, bufsize);
-
-    // Debug: compare current buffOutSize against the worst-case
-    // printf("ZSTD_compressBound(): %zu\n", ZSTD_compressBound(bufsize));
-
-    size_t compressed_size = 0;
-    lUInt8 *compressed_buf = NULL;
-
-    ZSTD_EndDirective const mode = ZSTD_e_end;
-    ZSTD_inBuffer input = { buf, bufsize, 0 };
-    int finished = 0;
-    do {
-        ZSTD_outBuffer output = { buffOut, buffOutSize, 0 };
-        size_t const remaining = ZSTD_compressStream2(cctx, &output, &input, mode);
-        if (ZSTD_isError(remaining)) {
-            CRLog::error("ZSTD_compressStream2() error: %s (%zu -> %zu)", ZSTD_getErrorName(remaining), bufsize, compressed_size);
-            if (compressed_buf) {
-                free(compressed_buf);
-            }
-            return false;
-        }
-
-        compressed_buf = cr_realloc(compressed_buf, compressed_size + output.pos);
-        memcpy(compressed_buf + compressed_size, buffOut, output.pos);
-        compressed_size += output.pos;
-
-        finished = (remaining == 0);
-        // printf("ldomPack(): finished? %d (current chunk: %zu/%zu; total in: %zu; total out: %zu)\n", finished, output.pos, output.size, bufsize, compressed_size);
-    } while (!finished);
-
-    dstsize = compressed_size;
-    dstbuf = compressed_buf;
-    // printf("ldomPack() done: %zu -> %zu\n", bufsize, compressed_size);
-    return true;
+    return kre_ldom_pack(buf, bufsize, &dstbuf, &dstsize) != 0;
 }
 
-bool CacheFile::allocDecompRess(void)
-{
-    // printf("CacheFile::allocDecompRess\n");
-    _decomp_ress = new zstd_decomp_ress_t;
-    _decomp_ress->buffOut = nullptr;
-    _decomp_ress->dctx = nullptr;
-
-    _decomp_ress->buffOutSize = ZSTD_DStreamOutSize();
-    _decomp_ress->buffOut = malloc(_decomp_ress->buffOutSize);
-    if (!_decomp_ress->buffOut) {
-        return false;
-    }
-    _decomp_ress->dctx = ZSTD_createDCtx();
-    if (_decomp_ress->dctx == nullptr) {
-        return false;
-    }
-
-    return true;
-}
-
-bool CacheFile::freeDecompRess(void)
-{
-    // printf("CacheFile::freeDecompRess\n");
-    if (_decomp_ress) {
-        ZSTD_freeDCtx(_decomp_ress->dctx);
-        _decomp_ress->dctx = nullptr;
-        free(_decomp_ress->buffOut);
-        _decomp_ress->buffOut = nullptr;
-        delete _decomp_ress;
-        _decomp_ress = nullptr;
-
-        return true;
-    }
-
-    return false;
-}
-
-/// unpack data from compbuf to dstbuf
+/// unpack data from compbuf to dstbuf using Rust implementation
 bool CacheFile::ldomUnpack( const lUInt8 * compbuf, size_t compsize, lUInt8 * &dstbuf, lUInt32 & dstsize  )
 {
-    // printf("ldomUnpack() <- %p (%zu)\n", compbuf, compsize);
-
-    // Lazy init our ressources, and keep 'em around
-    if (!_decomp_ress) {
-        if(!allocDecompRess()) {
-            CRLog::error("ldomUnpack() failed to allocate ressources");
-            return false;
-        }
-    }
-
-    // c.f., ZSTD's examples/streaming_decompression.c
-    size_t const buffOutSize = _decomp_ress->buffOutSize;
-    void*  const buffOut = _decomp_ress->buffOut;
-    ZSTD_DCtx* const dctx = _decomp_ress->dctx;
-
-    // Reset the context
-    size_t const err = ZSTD_DCtx_reset(dctx, ZSTD_reset_session_only);
-    if (ZSTD_isError(err)) {
-        CRLog::error("ZSTD_DCtx_reset() error: %s", ZSTD_getErrorName(err));
-        return false;
-    }
-
-    size_t uncompressed_size = 0;
-    lUInt8 *uncompressed_buf = NULL;
-
-    size_t lastRet = 0;
-    ZSTD_inBuffer input = { compbuf, compsize, 0 };
-    while (input.pos < input.size) {
-        ZSTD_outBuffer output = { buffOut, buffOutSize, 0 };
-        size_t const ret = ZSTD_decompressStream(dctx, &output , &input);
-        if (ZSTD_isError(ret)) {
-            CRLog::error("ZSTD_decompressStream() error: %s (%zu -> %zu)", ZSTD_getErrorName(ret), compsize, uncompressed_size);
-            if (uncompressed_buf) {
-                free(uncompressed_buf);
-            }
-            return false;
-        }
-
-        uncompressed_buf = cr_realloc(uncompressed_buf, uncompressed_size + output.pos);
-        memcpy(uncompressed_buf + uncompressed_size, buffOut, output.pos);
-        uncompressed_size += output.pos;
-
-        lastRet = ret;
-        // printf("ldomUnpack(): ret: %zu (current chunk: %zu/%zu)\n", ret, output.pos, output.size);
-    }
-
-    if (lastRet != 0) {
-        CRLog::error("ldomUnpack(): EOF before end of stream: %zu", lastRet);
-        if (uncompressed_buf) {
-            free(uncompressed_buf);
-        }
-        return false;
-    }
-
-    dstsize = uncompressed_size;
-    dstbuf = uncompressed_buf;
-    // printf("ldomUnpack() done: %zu -> %zu\n", compsize, uncompressed_size);
-    return true;
+    return kre_ldom_unpack(compbuf, compsize, &dstbuf, &dstsize) != 0;
 }
-#else
-/// pack data from buf to dstbuf
-bool CacheFile::ldomPack( const lUInt8 * buf, size_t bufsize, lUInt8 * &dstbuf, lUInt32 & dstsize )
-{
-    lUInt8 tmp[PACK_BUF_SIZE]; // 64K buffer for compressed data
-    int ret;
-    z_stream z;
-    z.zalloc = Z_NULL;
-    z.zfree = Z_NULL;
-    z.opaque = Z_NULL;
-    ret = deflateInit( &z, DOC_DATA_COMPRESSION_LEVEL );
-    if ( ret != Z_OK )
-        return false;
-    z.avail_in = bufsize;
-    z.next_in = (unsigned char *)buf;
-    int compressed_size = 0;
-    lUInt8 *compressed_buf = NULL;
-    while (true) {
-        z.avail_out = PACK_BUF_SIZE;
-        z.next_out = tmp;
-        ret = deflate( &z, Z_FINISH );
-        if (ret == Z_STREAM_ERROR) { // some error occured while packing
-            deflateEnd(&z);
-            if (compressed_buf)
-                free(compressed_buf);
-            // printf("deflate() error: %d (%d > %d)\n", ret, bufsize, compressed_size);
-            return false;
-        }
-        int have = PACK_BUF_SIZE - z.avail_out;
-        compressed_buf = cr_realloc(compressed_buf, compressed_size + have);
-        memcpy(compressed_buf + compressed_size, tmp, have ); // cppcheck-suppress uninitvar
-        compressed_size += have;
-        if (z.avail_out != 0) // buffer not fully filled = deflate is done
-            break;
-        // printf("deflate() additional call needed (%d > %d)\n", bufsize, compressed_size);
-    }
-    deflateEnd(&z);
-    dstsize = compressed_size;
-    dstbuf = compressed_buf;
-    // printf("deflate() done: %d > %d\n", bufsize, compressed_size);
-    return true;
-}
-
-/// unpack data from compbuf to dstbuf
-bool CacheFile::ldomUnpack( const lUInt8 * compbuf, size_t compsize, lUInt8 * &dstbuf, lUInt32 & dstsize  )
-{
-    lUInt8 tmp[UNPACK_BUF_SIZE]; // 256K buffer for uncompressed data
-    int ret;
-    z_stream z = { 0 };
-    z.zalloc = Z_NULL;
-    z.zfree = Z_NULL;
-    z.opaque = Z_NULL;
-    ret = inflateInit( &z );
-    if ( ret != Z_OK )
-        return false;
-    z.avail_in = compsize;
-    z.next_in = (unsigned char *)compbuf;
-    lUInt32 uncompressed_size = 0;
-    lUInt8 *uncompressed_buf = NULL;
-    while (true) {
-        z.avail_out = UNPACK_BUF_SIZE;
-        z.next_out = tmp;
-        ret = inflate( &z, Z_SYNC_FLUSH );
-        if (ret != Z_OK && ret != Z_STREAM_END) { // some error occured while unpacking
-            inflateEnd(&z);
-            if (uncompressed_buf)
-                free(uncompressed_buf);
-            // printf("inflate() error: %d (%d > %d)\n", ret, compsize, uncompressed_size);
-            return false;
-        }
-        lUInt32 have = UNPACK_BUF_SIZE - z.avail_out;
-        uncompressed_buf = cr_realloc(uncompressed_buf, uncompressed_size + have);
-        memcpy(uncompressed_buf + uncompressed_size, tmp, have ); // cppcheck-suppress uninitvar
-        uncompressed_size += have;
-        if (ret == Z_STREAM_END) {
-            break;
-        }
-        // printf("inflate() additional call needed (%d > %d)\n", compsize, uncompressed_size);
-    }
-    inflateEnd(&z);
-    dstsize = uncompressed_size;
-    dstbuf = uncompressed_buf;
-    // printf("inflate() done %d > %d\n", compsize, uncompressed_size);
-    return true;
-}
-#endif
 
 // BLOB storage
 
@@ -17271,10 +16944,7 @@ ContinuousOperationResult ldomDocument::saveChanges( CRTimerUtil & maxTime, LVDo
     CRLog::trace("ldomDocument::saveChanges() - done");
     if (progressCallback) progressCallback->OnSaveCacheFileEnd();
 
-#if (USE_ZSTD == 1)
-    // And now should be a good place to release ZSTD compression resources...
-    _cacheFile->freeCompRess();
-#endif
+    // No need to free compression resources - Rust handles its own memory
 
     return CR_DONE;
 }

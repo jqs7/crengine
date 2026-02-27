@@ -1,9 +1,66 @@
 #include "../include/epubfmt.h"
 #include "../include/fb2def.h"
 
-#if (USE_ZLIB==1)
-#include <zlib.h>
-#endif
+// Rust ZIP decompression
+extern "C" {
+    int kre_zip_decompress(const uint8_t* compressed, size_t compressed_size, 
+                          uint8_t** decompressed, size_t* decompressed_size);
+}
+
+// ============================================================================
+// Rust Parallel Spine Parsing Integration
+// ============================================================================
+extern "C" {
+#include "../../../../krengine/kre_epub_spine.h"
+}
+#include <mutex>
+#include <vector>
+#include <string>
+
+// Archive context for Rust callbacks
+struct KreEpubArchiveContext {
+    LVContainerRef arc;
+    std::mutex mutex;
+};
+
+static int kre_epub_get_file_size_cb(void* ctx, const char* path) {
+    if (!ctx || !path) return -1;
+    KreEpubArchiveContext* arc_ctx = static_cast<KreEpubArchiveContext*>(ctx);
+    
+    // Lock before any crengine operations (including string conversion)
+    std::lock_guard<std::mutex> lock(arc_ctx->mutex);
+    lString32 path32 = Utf8ToUnicode(lString8(path));
+    LVStreamRef stream = arc_ctx->arc->OpenStream(path32.c_str(), LVOM_READ);
+    if (stream.isNull()) return -1;
+    lvsize_t size = stream->GetSize();
+    return (size > INT_MAX) ? -1 : static_cast<int>(size);
+}
+
+static int kre_epub_read_file_cb(void* ctx, const char* path, uint8_t* buffer, size_t buffer_size) {
+    if (!ctx || !path || !buffer || buffer_size == 0) return -1;
+    KreEpubArchiveContext* arc_ctx = static_cast<KreEpubArchiveContext*>(ctx);
+    
+    // Lock before any crengine operations (including string conversion)
+    std::lock_guard<std::mutex> lock(arc_ctx->mutex);
+    lString32 path32 = Utf8ToUnicode(lString8(path));
+    LVStreamRef stream = arc_ctx->arc->OpenStream(path32.c_str(), LVOM_READ);
+    if (stream.isNull()) return -1;
+    lvsize_t size = stream->GetSize();
+    if (size > buffer_size) size = buffer_size;
+    lvsize_t bytes_read = 0;
+    if (stream->Read(buffer, size, &bytes_read) != LVERR_OK) return -1;
+    return static_cast<int>(bytes_read);
+}
+
+// Pre-parsed spine item result
+struct KrePreParsedItem {
+    int index;
+    std::string content;
+    std::string head_css;
+    bool success;
+    std::string error;
+};
+// ============================================================================
 
 class EpubItem {
 public:
@@ -595,59 +652,33 @@ static int sha1digest(uint8_t *digest, const uint8_t *data, size_t databytes) {
     return 0;
 }
 
-/* Attempt to decompress the whole buffer, return the original data on error. */
+/* Attempt to decompress the whole buffer using Rust, return the original data on error. */
 static LVByteArrayRef try_buffer_decompress(LVByteArrayRef packed) {
-#if (USE_ZLIB==1)
-    if (!packed)
+    if (!packed || packed->length() == 0)
         return packed;
 
-    const unsigned MINIMAL_CHUNK_SIZE = 1024;
-
-    LVByteArrayRef unpacked(new LVByteArray());
-    unpacked->reserve(MINIMAL_CHUNK_SIZE);
-
-    z_stream_s zstrm;
-    int        zerr;
-
-    memset(&zstrm, 0, sizeof (zstrm));
-    zstrm.avail_in = packed->length();
-    zstrm.next_in = packed->get();
-    zstrm.avail_out = unpacked->size();
-    zstrm.next_out = unpacked->get();
-
-    zerr = inflateInit2(&zstrm, -15);
-    for (;;) {
-        switch (zerr) {
-        case Z_OK:
-            break;
-        case Z_BUF_ERROR:
-            /* Not enough space in the output buffer. */
-            break;
-        case Z_STREAM_END:
-            /* The end… */
-            if (zstrm.total_out > (unsigned)unpacked->length())
-                unpacked->addSpace(zstrm.total_out - unpacked->length());
-            assert(zstrm.total_in == (unsigned)packed->length());
-            packed = unpacked;
-            [[fallthrough]];
-        default:
-            // The data was not compressed or is corrupted.
-            goto end;
-        }
-        if (Z_BUF_ERROR == zerr || zstrm.avail_out < MINIMAL_CHUNK_SIZE) {
-            if (zstrm.total_out > (unsigned)unpacked->length())
-                unpacked->addSpace(zstrm.total_out - unpacked->length());
-            unpacked->reserve(MINIMAL_CHUNK_SIZE + zstrm.total_out + 2 * zstrm.avail_in);
-            zstrm.avail_out = unpacked->size() - zstrm.total_out;
-            zstrm.next_out = unpacked->get() + zstrm.total_out;
-        }
-        zerr = inflate(&zstrm, Z_FINISH);
+    uint8_t* decompressed = nullptr;
+    size_t decompressed_size = 0;
+    
+    int result = kre_zip_decompress(
+        packed->get(),
+        packed->length(),
+        &decompressed,
+        &decompressed_size
+    );
+    
+    if (result != 1 || !decompressed) {
+        // Decompression failed, return original data
+        return packed;
     }
-
-end:
-    inflateEnd(&zstrm);
-#endif
-    return packed;
+    
+    // Create new byte array with decompressed data
+    LVByteArrayRef unpacked(new LVByteArray(decompressed, decompressed_size));
+    
+    // Free the Rust-allocated memory
+    free(decompressed);
+    
+    return unpacked;
 }
 
 // Adobe obfuscated item demangling proxy: XORs first 1024 bytes of source stream with key
@@ -1293,9 +1324,13 @@ bool ImportEpubDocument( LVStreamRef stream, ldomDocument * m_doc, LVDocViewCall
             CacheLoadingCallback * formatCallback, bool metadataOnly,
             const elem_def_t * node_scheme, const attr_def_t * attr_scheme, const ns_def_t * ns_scheme )
 {
+    CRLog::info("EPUB: ImportEpubDocument called, metadataOnly=%d", metadataOnly);
     LVContainerRef arc = LVOpenArchieve( stream );
-    if ( arc.isNull() )
+    if ( arc.isNull() ) {
+        CRLog::error("EPUB: Failed to open archive");
         return false; // not a ZIP archive
+    }
+    CRLog::info("EPUB: Archive opened successfully");
 
     // check root media type
     lString32 rootfilePath = EpubGetRootFilePath(arc);
@@ -1883,6 +1918,76 @@ bool ImportEpubDocument( LVStreamRef stream, ldomDocument * m_doc, LVDocViewCall
             //CRLog::trace("subst: %s => %s", LCSTR(name), LCSTR(subst));
         }
     }
+
+    // ========================================================================
+    // Parallel Pre-parsing with Rust
+    // ========================================================================
+    CRLog::info("EPUB: Using parallel spine parsing for %zu items", spineItemsNb);
+
+    // Prepare spine items for Rust
+    std::vector<KreSpineItemInfo> kreItems(spineItemsNb);
+    std::vector<std::string> hrefStrings(spineItemsNb);
+    std::vector<std::string> idStrings(spineItemsNb);
+    std::vector<std::string> mediaTypeStrings(spineItemsNb);
+
+    for (size_t i = 0; i < spineItemsNb; i++) {
+        lString32 fullPath = LVCombinePaths(codeBase, spineItems[i]->href);
+        hrefStrings[i] = UnicodeToUtf8(fullPath).c_str();
+        idStrings[i] = UnicodeToUtf8(spineItems[i]->id).c_str();
+        mediaTypeStrings[i] = UnicodeToUtf8(spineItems[i]->mediaType).c_str();
+
+        kreItems[i].href = hrefStrings[i].c_str();
+        kreItems[i].id = idStrings[i].c_str();
+        kreItems[i].media_type = mediaTypeStrings[i].c_str();
+        kreItems[i].is_xhtml = spineItems[i]->is_xhtml ? 1 : 0;
+        kreItems[i].nonlinear = spineItems[i]->nonlinear ? 1 : 0;
+        kreItems[i].index = static_cast<int>(i);
+    }
+
+    // Create archive context
+    KreEpubArchiveContext arcContext;
+    arcContext.arc = m_arc;
+
+    KreFileReadContext fileCtx;
+    fileCtx.ctx = &arcContext;
+    fileCtx.read_file = kre_epub_read_file_cb;
+    fileCtx.get_file_size = kre_epub_get_file_size_cb;
+    fileCtx.code_base = "";  // Paths already combined
+
+    // Call Rust parallel parser
+    CRLog::info("EPUB: Calling Rust parallel parser with %zu items", spineItemsNb);
+    KreSpineParseResult parseResult = kre_epub_parse_spine_parallel(
+        kreItems.data(), spineItemsNb, &fileCtx);
+    CRLog::info("EPUB: Rust parallel parser returned, status=%d, count=%zu", 
+                parseResult.status, parseResult.count);
+
+    if (parseResult.status != KRE_EPUB_SUCCESS || parseResult.count == 0) {
+        CRLog::error("EPUB: Parallel parsing failed (status=%d)", parseResult.status);
+        kre_epub_free_parse_result(&parseResult);
+        return false;
+    }
+
+    CRLog::info("EPUB: Parallel parsing completed: %zu success, %zu failed",
+                parseResult.success_count, parseResult.failed_count);
+
+    std::vector<KrePreParsedItem> preParsedItems(parseResult.count);
+    for (size_t i = 0; i < parseResult.count; i++) {
+        const KreParsedSpineItem& item = parseResult.items[i];
+        KrePreParsedItem& result = preParsedItems[i];
+        result.index = item.index;
+        result.success = (item.status == KRE_EPUB_SUCCESS);
+        if (result.success && item.content && item.content_len > 0) {
+            result.content.assign(item.content, item.content_len);
+        }
+        if (item.head_css && item.head_css_len > 0) {
+            result.head_css.assign(item.head_css, item.head_css_len);
+        }
+        if (item.error_msg) {
+            result.error = item.error_msg;
+        }
+    }
+    kre_epub_free_parse_result(&parseResult);
+
     int lastProgressPercent = 5;
     for ( size_t i=0; i<spineItemsNb; i++ ) {
         if ( progressCallback ) {
@@ -1906,50 +2011,40 @@ bool ImportEpubDocument( LVStreamRef stream, ldomDocument * m_doc, LVDocViewCall
                 appender.setNonLinearFlag(spineItems[i]->nonlinear);
                 appender.setFragmentType(); // unset
                 CRLog::debug("Checking fragment: %s", LCSTR(name));
-                LVStreamRef stream = m_arc->OpenStream(name.c_str(), LVOM_READ);
-                if ( !stream.isNull() ) {
-                    lString32 base = name;
-                    LVExtractLastPathElement(base);
-                    //CRLog::trace("base: %s", LCSTR(base));
-                    LVHTMLParser parser(stream, &appender);
-                    if ( parser.CheckFormat() && parser.Parse() && appender.hasMetBaseTag() ) {
-                        // CheckFormat() is not perfect (the two bytes "ul" in some encrypted stream
-                        // will get CheckFormat() to succeed) and Parse() won't complain.
-                        // Checking hasMetBaseTag() ensures we have met a <body> and that
-                        // a <DocFragment> has been added into the DOM.
-                        handled = true;
-                        fragmentCount++;
-                        // We may also meet @font-face in the html <head><style>
-                        lString8 headCss = appender.getHeadStyleText();
-                        //CRLog::trace("style: %s", headCss.c_str());
-                        styleParser.parse(base, headCss);
-                    }
-                    if ( !handled && relaxed_spine ) {
-                        // SVG are allowed in the <spine>
-                        LVXMLParser svgparser(stream, &writer, false, false, true);
-                        if (svgparser.CheckFormat()) {
-                            appender.setFragmentType(U"SpineSvgWrapper");
-                            // Alas, we can't easily have this svgparser drive writer or appender
-                            // after we would ourselve OnTagOpen(body/html/div) as the parser would
-                            // autoclose everything...
-                            // SVGs in the spine are rare, so let's not hack these parser/writers,
-                            // and get ugly and build some HTML as string that we will fed as
-                            // a stream to a HTMLParser.
-                            stream->SetPos(0);
-                            LVStreamRef mstream = LVCreateMemoryStream();
-                            // Make the SVG image horizontally centered (as for standalone SVG
-                            // image documents, see top of ldomNode::initNodeRendMethod()).
-                            lString8 s("<html><body><autoBoxing style='text-align: center'>");
-                            mstream->Write(s.c_str(), s.length(), NULL);
-                            LVPumpStream(mstream.get(), stream.get());
-                            s = "</autoBoxing></body></html>";
-                            mstream->Write(s.c_str(), s.length(), NULL);
-                            LVHTMLParser mparser(mstream, &appender);
-                            mparser.Parse();
+
+                // Use pre-parsed content from Rust parallel parsing
+                if (i < preParsedItems.size()) {
+                    const KrePreParsedItem& preParsed = preParsedItems[i];
+                    if (preParsed.success && !preParsed.content.empty()) {
+                        // Create memory stream from pre-parsed content
+                        LVStreamRef mstream = LVCreateMemoryStream(
+                            (lUInt8*)preParsed.content.data(),
+                            preParsed.content.size(),
+                            false  // Don't copy
+                        );
+                        lString32 base = name;
+                        LVExtractLastPathElement(base);
+
+                        LVHTMLParser parser(mstream, &appender);
+                        if (parser.CheckFormat() && parser.Parse() && appender.hasMetBaseTag()) {
                             handled = true;
                             fragmentCount++;
+                            // Use pre-extracted CSS if available
+                            if (!preParsed.head_css.empty()) {
+                                styleParser.parse(base, lString8(preParsed.head_css.c_str()));
+                            } else {
+                                lString8 headCss = appender.getHeadStyleText();
+                                styleParser.parse(base, headCss);
+                            }
+                        } else {
+                            CRLog::error("Failed to parse pre-parsed content for fragment %s", LCSTR(name));
                         }
+                    } else {
+                        CRLog::error("Pre-parsed content not available or failed for fragment %s: %s",
+                                   LCSTR(name), preParsed.error.c_str());
                     }
+                } else {
+                    CRLog::error("Pre-parsed item index out of range: %zu >= %zu", i, preParsedItems.size());
                 }
                 if ( !handled && relaxed_spine ) {
                     CRLog::error("Document type is not XML/XHTML for fragment %s", LCSTR(name));
@@ -2219,3 +2314,26 @@ bool ImportEpubDocument( LVStreamRef stream, ldomDocument * m_doc, LVDocViewCall
     return true;
 
 }
+
+// ============================================================================
+// C API for Lua/FFI access to parallel parsing settings
+// ============================================================================
+
+extern "C" {
+
+/// Check if parallel EPUB parsing is available
+int kre_epub_cpp_parallel_available() {
+    return kre_epub_parallel_available();
+}
+
+/// Get number of parallel workers
+int kre_epub_cpp_get_workers() {
+    return kre_epub_get_parallel_workers();
+}
+
+/// Set number of parallel workers (0 = auto)
+int kre_epub_cpp_set_workers(int num_workers) {
+    return kre_epub_set_parallel_workers(num_workers);
+}
+
+} // extern "C"

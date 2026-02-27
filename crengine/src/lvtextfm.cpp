@@ -35,6 +35,9 @@
 #include <fribidi.h>
 #endif
 
+// Rust parallel text processing support
+#include "../../../../krengine/kre_text_format.h"
+
 #define SPACE_WIDTH_SCALE_PERCENT 100
 #define MIN_SPACE_CONDENSING_PERCENT 50
 #define UNUSED_SPACE_THRESHOLD_PERCENT 5
@@ -1437,19 +1440,12 @@ public:
                             // a space following a \n be allowed to collapse.
                     }
 
-                    if ( lStr_isCJK(c) ) {
-                        // We have some specific code for handling CJK typography, that we don't
-                        // need to trigger if we didn't meet any CJK char.
+                    // Use Rust helper for CJK detection (faster inline check)
+                    if ( kre_is_cjk_char((uint32_t)c) ) {
                         if ( !m_has_cjk ) {
                             m_has_cjk = true;
                         }
                         m_flags[pos] |= LCHAR_IS_CJK;
-                        // Some CJK fullwidth punctuation char usually have a good amount of
-                        // their glyph width blank, and we can reduce their width if needed.
-                        // We explicitely don't set this flag (which is enough to not have
-                        // any related processing done) when kerning is disabled (as this is
-                        // doing some kind of kerning) to allow comparing, and in case some
-                        // people prefer to get the legacy non-tweaked rendering.
                         if ( m_kerning_mode != KERNING_MODE_DISABLED && getCJKCharType(c) != cjkt_other )
                             m_flags[pos] |= LCHAR_IS_FLEXIBLE_WIDTH_CJK;
                     }
@@ -1558,7 +1554,7 @@ public:
                         // we don't need to invoke expensive fribidi processing below (which
                         // may add a 50% duration increase to the text rendering phase).
                         if ( !has_rtl ) {
-                            has_rtl = lStr_isRTL(c);
+                            has_rtl = kre_is_rtl_char((uint32_t)c);
                         }
                     #endif
 
@@ -2019,109 +2015,105 @@ public:
                         if ( lastSrc->flags & LTEXT_FLAG_PREFORMATTED )
                             scale_space_width = false;
                     }
-                    int cumulative_width_removed = 0;
-                    int prev_orig_measured_width = 0;
-                    int char_width = 0; // current single char width
-                    for ( int k=0; k<len; k++ ) {
-                        // printf("%c %x f=%d w=%d\n", m_text[start+k], m_text[start+k], flags[k], widths[k]);
-                        char_width = widths[k] - prev_orig_measured_width;
-                        prev_orig_measured_width = widths[k];
-                        if ( m_flags[start + k] & LCHAR_IS_COLLAPSED_SPACE) {
-                            cumulative_width_removed += char_width;
-                            // make it zero width: same cumulative width as previous char's
-                            widths[k] = k>0 ? widths[k-1] : 0;
-                            flags[k] = 0; // remove SPACE/WRAP/... flags
+                    // Use Rust parallel processing for width adjustments
+                    // Note: first_word_len handling is done in C++ below
+                    {
+                        // Temporary buffers for Rust call
+                        lUInt32* text_buf = new lUInt32[len];
+                        for ( int k=0; k<len; k++ ) {
+                            text_buf[k] = (lUInt32)m_text[start+k];
                         }
-                        else if ( flags[k] & LCHAR_IS_SPACE ) {
-                            // LCHAR_IS_SPACE has just been guessed, and is available in flags[], not yet in m_flags[]
-                            if ( scale_space_width ) {
-                                int scaled_width = char_width * m_pbuffer->space_width_scale_percent / 100;
-                                // We can just account for the space reduction (or increase) in cumulative_width_removed
-                                cumulative_width_removed += char_width - scaled_width;
+
+                        // Merge m_flags (copyText phase: LCHAR_IS_COLLAPSED_SPACE, LCHAR_IS_CJK, etc.)
+                        // with font flags[] (measureText phase: LCHAR_IS_SPACE, LCHAR_ALLOW_WRAP_AFTER, etc.)
+                        // so Rust sees the complete picture for width adjustment decisions.
+                        lUInt16* merged_flags = new lUInt16[len];
+                        for ( int k=0; k<len; k++ ) {
+                            merged_flags[k] = m_flags[start + k] | (lUInt16)flags[k];
+                        }
+
+                        int32_t* output_widths = new int32_t[len];
+
+                        int32_t final_width = kre_measure_text_chunk(
+                            text_buf,
+                            len,
+                            merged_flags,
+                            widths,
+                            output_widths,
+                            len,
+                            lastWidth,
+                            scale_space_width ? m_pbuffer->space_width_scale_percent : 100,
+                            m_pbuffer->cjk_width_scale_percent
+                        );
+
+                        // Copy results back
+                        for ( int k=0; k<len; k++ ) {
+                            m_widths[start + k] = output_widths[k];
+                            #if (USE_LIBUNIBREAK==1)
+                            flags[k] &= ~(LCHAR_ALLOW_WRAP_AFTER|LCHAR_DEPRECATED_WRAP_AFTER);
+                            #endif
+                            // Don't merge flags for collapsed spaces: mirrors C++ behavior of
+                            // flags[k] = 0 for collapsed spaces, preventing LCHAR_IS_SPACE
+                            // and other flags from leaking into m_flags for collapsed chars.
+                            if ( !(m_flags[start + k] & LCHAR_IS_COLLAPSED_SPACE) ) {
+                                m_flags[start + k] |= flags[k];
                             }
-                            // remove, from the measured cumulative width, what we just, and previously, removed
-                            widths[k] -= cumulative_width_removed;
-                            if ( first_word_len >= 0 ) { // This is the space (or nbsp) after first word
-                                bool keep_checking = false;
-                                if ( first_word_len == 0 ) { // No word yet on the left
-                                    // Leading space(s), probably no-break-space, which might be used
-                                    // as indentation (ie. with poetry): don't allow their width to
-                                    // be changed by text justification to keep similar lines aligned.
-                                    // (Note: in RTL paragraphs, this would seem to not be needed, may
-                                    // be because trailing spaces are part of the last word and won't
-                                    // be expanded in alignLine().)
-                                    flags[k] |= LCHAR_LOCKED_SPACING;
-                                    keep_checking = true;
-                                }
-                                if ( first_word_len == 1 ) { // Previous word is a single char
-                                    if ( k > 0 && isLeftPunctuation(m_text[k-1]) ) {
-                                        // This space follows one of the common opening quotation marks or
-                                        // dashes used to introduce a quotation or a part of a dialog:
-                                        // https://en.wikipedia.org/wiki/Quotation_mark
-                                        // Don't allow this space to change width, so text justification
-                                        // doesn't move away next word, so that other similar paragraphs
-                                        // get their real first words vertically aligned.
+                        }
+
+                        // Handle first_word_len and LCHAR_LOCKED_SPACING logic
+                        for ( int k=0; k<len; k++ ) {
+                            if ( m_flags[start + k] & LCHAR_IS_COLLAPSED_SPACE ) {
+                                // Skip collapsed spaces entirely, matching C++ flags[k]=0 behavior
+                                continue;
+                            }
+                            if ( flags[k] & LCHAR_IS_SPACE ) {
+                                if ( first_word_len >= 0 ) {
+                                    bool keep_checking = false;
+                                    if ( first_word_len == 0 ) {
                                         flags[k] |= LCHAR_LOCKED_SPACING;
-                                        // Also prevent that quotation mark or dash from getting
-                                        // additional letter spacing for justification
-                                        flags[k-1] |= LCHAR_LOCKED_SPACING;
-                                        // If what's coming next is also such a char, continue doing that
-                                        if ( k+1 < len && isLeftPunctuation(m_text[k+1]) ) {
-                                            keep_checking = true;
+                                        keep_checking = true;
+                                    }
+                                    if ( first_word_len == 1 ) {
+                                        if ( k > 0 && isLeftPunctuation(m_text[start+k-1]) ) {
+                                            flags[k] |= LCHAR_LOCKED_SPACING;
+                                            flags[k-1] |= LCHAR_LOCKED_SPACING;
+                                            if ( k+1 < len && isLeftPunctuation(m_text[start+k+1]) ) {
+                                                keep_checking = true;
+                                            }
                                         }
-                                        //
-                                        // Note: we do this check here, with the text still in logical
-                                        // order, so we get that working with RTL text too (where, in
-                                        // visual order, we'll have lost track of which word is the
-                                        // first word - untested though).
                                     }
+                                    if ( keep_checking )
+                                        first_word_len = 0;
+                                    else
+                                        first_word_len = -1;
                                 }
-                                if ( keep_checking )
-                                    first_word_len = 0;
-                                else
-                                    first_word_len = -1; // We don't need to deal with this anymore
                             }
-                        }
-                        else {
-                            // remove, from the measured cumulative width, what we previously removed
-                            widths[k] -= cumulative_width_removed;
-                            if ( first_word_len >= 0 ) {
-                                // Not a collapsed space and not a space: this will be part of first word
-                                first_word_len++;
-                            }
-                            if ( m_has_cjk ) {
-                                lChar32 ch = m_text[start+k];
-                                if ( ch <= 0x201D && ch >= 0x2018 && (ch <= 0x2019 || ch >= 0x201C) ) {
-                                    // Most CJK fonts provide a fullwidth glyph for U+2018/2019/201C/201D
-                                    // LEFT/RIGHT SINGLE/DOUBLE QUOTATION MARK (we checked all the non-CJK
-                                    // punctuation ranges with various CJK fonts, and found out only these
-                                    // four get a fullwidth glyph.)
-                                    // This is also dependant on the language/locl: a same font may give
-                                    // them fullwidth for Chinese, but not for Japanese.
-                                    // Try to guess if this is the case: most "Sans" CJK fonts don't make all
-                                    // the glyphs have their width = 1em, so allow for a little less.
-                                    if ( char_width >= lastFont->getSize() * 4/5 ) {
-                                        // Consider this char as CJK, and as a flexible CJK char
-                                        // if kerning is not disabled.
-                                        m_flags[start+k] |= LCHAR_IS_CJK | (m_kerning_mode != KERNING_MODE_DISABLED ? LCHAR_IS_FLEXIBLE_WIDTH_CJK : 0);
+                            else {
+                                if ( first_word_len >= 0 ) {
+                                    first_word_len++;
+                                }
+                                if ( m_has_cjk ) {
+                                    lChar32 ch = m_text[start+k];
+                                    if ( ch <= 0x201D && ch >= 0x2018 && (ch <= 0x2019 || ch >= 0x201C) ) {
+                                        int char_width = (k > 0) ? (widths[k] - widths[k-1]) : widths[k];
+                                        if ( char_width >= lastFont->getSize() * 4/5 ) {
+                                            m_flags[start+k] |= LCHAR_IS_CJK | (m_kerning_mode != KERNING_MODE_DISABLED ? LCHAR_IS_FLEXIBLE_WIDTH_CJK : 0);
+                                        }
                                     }
-                                }
-                                if ( m_pbuffer->cjk_width_scale_percent != 100 && m_flags[start+k] & LCHAR_IS_CJK && char_width > 0 ) {
-                                    int added_width = char_width * m_pbuffer->cjk_width_scale_percent / 100 - char_width;
-                                    widths[k] += added_width;
-                                    cumulative_width_removed -= added_width; // (a negative cumulative_width_removed is cumulative width added)
                                 }
                             }
                         }
-                        m_widths[start + k] = lastWidth + widths[k];
-                        #if (USE_LIBUNIBREAK==1)
-                        // Reset these flags if lastFont->measureText() has set them, as we trust
-                        // only libunibreak (which is more clever with hyphens, that our code flag
-                        // with LCHAR_DEPRECATED_WRAP_AFTER).
-                        flags[k] &= ~(LCHAR_ALLOW_WRAP_AFTER|LCHAR_DEPRECATED_WRAP_AFTER);
-                        #endif
-                        m_flags[start + k] |= flags[k];
-                        // printf("  => w=%d\n", m_widths[start + k]);
+
+                        lastWidth = final_width;
+                        // Patch widths[len-1] so the shared "lastWidth += widths[len-1]"
+                        // below becomes a no-op (Rust already set lastWidth to the correct
+                        // absolute value; adding widths[len-1] again would double-count it).
+                        if (len > 0)
+                            widths[len-1] = 0;
+
+                        delete[] text_buf;
+                        delete[] merged_flags;
+                        delete[] output_widths;
                     }
 
                     /* If the following was ever needed, it was wrong to do it at this step
