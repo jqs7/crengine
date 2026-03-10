@@ -369,6 +369,10 @@ private:
     lString32 m_pageHeaderOverride;
     /// custom page info (curpage / nbpages %) can be set by frontend
     lString32 m_pageInfoOverride;
+    /// per-flow progress cache used by getPosPercent() in page mode
+    LVArray<int> m_page_rank_in_flow;
+    LVArray<int> m_flow_total_pages;
+    bool m_flow_progress_cache_valid;
 
     int m_drawBufferBits;
 
@@ -389,6 +393,8 @@ private:
     void insertBookmarkPercentInfo(int start_page, int end_y, int percent);
 
     void updateDocStyleSheet();
+    void invalidateFlowProgressCache();
+    void buildFlowProgressCache();
 
 protected:
     /// returns document offset for next page

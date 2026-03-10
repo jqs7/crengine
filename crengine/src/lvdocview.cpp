@@ -210,6 +210,7 @@ LVDocView::LVDocView(int bitsPerPixel, bool noDefaultDocument) :
 	m_doc_props = LVCreatePropsContainer();
 	propsUpdateDefaults( m_props);
 	m_alt_doc_props = LVCreatePropsContainer();
+    m_flow_progress_cache_valid = false;
 
 	//m_drawbuf.Clear(m_backgroundColor);
 
@@ -561,6 +562,7 @@ void LVDocView::Clear() {
 		m_filename.clear();
 		m_section_bounds_valid = false;
 	}
+    invalidateFlowProgressCache();
 	clearImageCache();
 	_navigationHistory.clear();
 	// Also drop font instances from previous document (see
@@ -577,12 +579,49 @@ void LVDocView::clearImageCache() {
 		m_callback->OnImageCacheClear();
 }
 
+void LVDocView::invalidateFlowProgressCache() {
+    m_flow_progress_cache_valid = false;
+    m_page_rank_in_flow.clear();
+    m_flow_total_pages.clear();
+}
+
+void LVDocView::buildFlowProgressCache() {
+    m_page_rank_in_flow.clear();
+    m_flow_total_pages.clear();
+
+    int page_count = m_pages.length();
+    if (page_count <= 0) {
+        m_flow_progress_cache_valid = true;
+        return;
+    }
+
+    m_page_rank_in_flow.reserve(page_count);
+    for (int i = 0; i < page_count; i++) {
+        m_page_rank_in_flow.add(0);
+    }
+
+    for (int i = 0; i < page_count; i++) {
+        int flow = m_pages[i]->flow;
+        if (flow < 0) {
+            flow = 0;
+        }
+        while (m_flow_total_pages.length() <= flow) {
+            m_flow_total_pages.add(0);
+        }
+        m_flow_total_pages[flow] = m_flow_total_pages[flow] + 1;
+        m_page_rank_in_flow[i] = m_flow_total_pages[flow];
+    }
+
+    m_flow_progress_cache_valid = true;
+}
+
 /// invalidate formatted data, request render
 void LVDocView::requestRender() {
 	LVLock lock(getMutex());
 	if (!m_doc) // nothing to render when noDefaultDocument=true
 		return;
 	m_is_rendered = false;
+    invalidateFlowProgressCache();
 	clearImageCache();
 	m_doc->clearRendBlockCache();
 }
@@ -1653,6 +1692,29 @@ int LVDocView::getPosPercent() {
 		else
 			return 0;
 	} else {
+        bool flow_percent = m_props->getBoolDef(PROP_NONLINEAR_PAGEBREAK, false)
+            && m_pages.hasNonLinearFlows() && getVisiblePageCount() == 1;
+        if (flow_percent) {
+            int page_index = getCurPage(true);
+            if (page_index >= 0 && page_index < m_pages.length()) {
+                if (!m_flow_progress_cache_valid || m_page_rank_in_flow.length() != m_pages.length()) {
+                    buildFlowProgressCache();
+                }
+                int flow = m_pages[page_index]->flow;
+                if (flow >= 0 && flow < m_flow_total_pages.length()) {
+                    int total = m_flow_total_pages[flow];
+                    int rank = m_page_rank_in_flow[page_index];
+                    if (total > 0) {
+                        if (rank < 1) {
+                            rank = 1;
+                        } else if (rank > total) {
+                            rank = total;
+                        }
+                        return (int)(((lInt64) rank * 10000) / total);
+                    }
+                }
+            }
+        }
         int fh = m_pages.length();
         if ( (getVisiblePageCount()==2 && (fh&1)) )
             fh++;
@@ -3105,6 +3167,9 @@ void LVDocView::Render(int dx, int dy, LVRendPageList * pages) {
 		}
 #endif
 		if ( did_rerender ) {
+            if (pages == &m_pages) {
+                invalidateFlowProgressCache();
+            }
 			m_section_bounds_valid = false;
 			fontMan->gc();
 		}
@@ -3702,6 +3767,7 @@ void LVDocView::setViewMode(LVDocViewMode view_mode, int visiblePageCount) {
 		return;
 	clearImageCache();
 	LVLock lock(getMutex());
+    invalidateFlowProgressCache();
 	m_view_mode = view_mode;
 	m_props->setInt(PROP_PAGE_VIEW_MODE, m_view_mode == DVM_PAGES ? 1 : 0);
     if (visiblePageCount == 1 || visiblePageCount == 2) {
@@ -3752,6 +3818,7 @@ void LVDocView::setVisiblePageCount(int n, bool onlyIfSane) {
     //CRLog::trace("setVisiblePageCount(%d) currPages=%d", n, m_pagesVisible);
     clearImageCache();
 	LVLock lock(getMutex());
+    invalidateFlowProgressCache();
     m_pagesVisible_onlyIfSane = onlyIfSane;
     int newCount = (n == 2) ? 2 : 1;
     if (m_pagesVisible == newCount)
